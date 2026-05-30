@@ -1,0 +1,796 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_FILE="$ROOT_DIR/.env"
+SYSTEM_ENV_FILE="${HOSTINATOR_ENV_FILE:-/etc/hostinator/hostinator.env}"
+
+load_env_file() {
+	local file="$1"
+	[[ -f "$file" ]] || return 0
+	set -a
+	# shellcheck disable=SC1090
+	. "$file"
+	set +a
+}
+
+load_env_file "$SYSTEM_ENV_FILE"
+load_env_file "$ENV_FILE"
+
+HOSTINATOR_HOME="${HOSTINATOR_HOME:-$HOME/hostinator}"
+APPS_DIR="${APPS_DIR:-$HOSTINATOR_HOME/repos}"
+STATE_DIR="${STATE_DIR:-$HOSTINATOR_HOME/state}"
+RUN_DIR="${RUN_DIR:-$HOSTINATOR_HOME/run}"
+STATE_FILE="$STATE_DIR/sites.tsv"
+LOCK_FILE="$STATE_DIR/hostinator.lock"
+
+BASE_DOMAIN="${BASE_DOMAIN:-}"
+CADDYFILE="${CADDYFILE:-/etc/caddy/Caddyfile}"
+CADDY_SITES_DIR="${CADDY_SITES_DIR:-/etc/caddy/sites}"
+HOSTINATOR_WEBHOOK_ADDR="${HOSTINATOR_WEBHOOK_ADDR:-127.0.0.1:7878}"
+HOSTINATOR_CICD_SUBDOMAIN="${HOSTINATOR_CICD_SUBDOMAIN:-ci-cd}"
+HOSTINATOR_CICD_DOMAIN="${HOSTINATOR_CICD_DOMAIN:-}"
+HOSTINATOR_PORT_START="${HOSTINATOR_PORT_START:-18000}"
+HOSTINATOR_PORT_END="${HOSTINATOR_PORT_END:-18999}"
+
+usage() {
+	cat <<'EOF'
+Usage:
+  ./bin/hostinator init
+  ./bin/hostinator add <sous-domaine|domaine> <repo-git> [options]
+  ./bin/hostinator add <repo-git> <sous-domaine|domaine> [options]
+  ./bin/hostinator update <sous-domaine|domaine> [--no-build]
+  ./bin/hostinator remove <sous-domaine|domaine>
+  ./bin/hostinator list
+  ./bin/hostinator webhook-update --repo <repo-git> [--repo <repo-git>] --branch <branche>
+
+Options add:
+  --branch <branche>       Branche Git à cloner/checkout
+  --service <service>      Service Docker Compose à exposer
+  --port <port>            Port interne du service
+  --host-port <port>       Port localhost utilisé par Caddy
+  --compose <fichier>      Fichier compose du repo, ex: docker-compose.prod.yml
+  --build                  Force docker compose up --build
+
+Exemples:
+  ./bin/hostinator init
+  ./bin/hostinator add api https://github.com/org/api.git --port 3000
+  ./bin/hostinator add https://github.com/org/site.git blog --service web --port 8080
+EOF
+}
+
+log() {
+	printf '[hostinator] %s\n' "$*"
+}
+
+warn() {
+	printf '[hostinator] Attention: %s\n' "$*" >&2
+}
+
+die() {
+	printf '[hostinator] Erreur: %s\n' "$*" >&2
+	exit 1
+}
+
+require_cmd() {
+	command -v "$1" >/dev/null 2>&1 || die "commande introuvable: $1"
+}
+
+require_runtime() {
+	require_cmd docker
+	require_cmd git
+	docker compose version >/dev/null 2>&1 || die "Docker Compose v2 est requis: docker compose version"
+}
+
+as_root() {
+	if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+		"$@"
+	else
+		require_cmd sudo
+		sudo "$@"
+	fi
+}
+
+ensure_dirs() {
+	mkdir -p "$APPS_DIR" "$STATE_DIR" "$RUN_DIR/compose-overrides"
+	as_root mkdir -p "$CADDY_SITES_DIR" "$(dirname "$CADDYFILE")"
+}
+
+with_deploy_lock() {
+	ensure_dirs
+	if command -v flock >/dev/null 2>&1; then
+		exec 9>"$LOCK_FILE"
+		flock 9
+	fi
+}
+
+ensure_caddy_config() {
+	ensure_dirs
+
+	if [[ ! -f "$CADDYFILE" ]]; then
+		local tmp
+		tmp="$(mktemp "$STATE_DIR/Caddyfile.tmp.XXXXXX")"
+		{
+			printf '{\n'
+			printf '\t# Décommente si tu veux associer les certificats Let'\''s Encrypt à un email.\n'
+			printf '\t# email admin@example.com\n'
+			printf '}\n\n'
+			printf 'import %s/*.caddy\n' "$CADDY_SITES_DIR"
+		} > "$tmp"
+		as_root install -m 0644 "$tmp" "$CADDYFILE"
+		rm -f "$tmp"
+		return
+	fi
+
+	if ! grep -Eq "^[[:space:]]*import[[:space:]]+$CADDY_SITES_DIR/[*][.]caddy" "$CADDYFILE"; then
+		warn "$CADDYFILE existe déjà. Ajoute cette ligne pour charger les sites Hostinator:"
+		warn "import $CADDY_SITES_DIR/*.caddy"
+	fi
+}
+
+reload_caddy() {
+	ensure_caddy_config
+	log "Rechargement de Caddy"
+
+	if command -v caddy >/dev/null 2>&1; then
+		as_root caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null
+	fi
+
+	if command -v systemctl >/dev/null 2>&1 && as_root systemctl is-active --quiet caddy; then
+		as_root systemctl reload caddy
+		return
+	fi
+
+	require_cmd caddy
+	as_root caddy reload --config "$CADDYFILE" --adapter caddyfile >/dev/null
+}
+
+webhook_port() {
+	local port="${HOSTINATOR_WEBHOOK_ADDR##*:}"
+	validate_port "$port" || die "HOSTINATOR_WEBHOOK_ADDR invalide: $HOSTINATOR_WEBHOOK_ADDR"
+	printf '%s\n' "$port"
+}
+
+is_git_ref() {
+	[[ "$1" == git@* || "$1" == ssh://* || "$1" == http://* || "$1" == https://* || "$1" == *.git ]]
+}
+
+validate_label() {
+	local label="$1"
+	[[ "$label" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]
+}
+
+validate_domain() {
+	local domain="$1"
+	[[ ${#domain} -le 253 ]] || return 1
+	[[ "$domain" != *..* ]] || return 1
+	IFS='.' read -r -a labels <<< "$domain"
+	[[ ${#labels[@]} -ge 2 ]] || return 1
+	local label
+	for label in "${labels[@]}"; do
+		validate_label "$label" || return 1
+	done
+}
+
+validate_port() {
+	local port="$1"
+	[[ "$port" =~ ^[0-9]{1,5}$ ]] || return 1
+	(( port >= 1 && port <= 65535 ))
+}
+
+domain_for() {
+	local raw="${1,,}"
+	raw="${raw%.}"
+	if [[ "$raw" == *.* ]]; then
+		validate_domain "$raw" || die "domaine invalide: $1"
+		printf '%s\n' "$raw"
+		return
+	fi
+
+	validate_label "$raw" || die "sous-domaine invalide: $1"
+	[[ -n "$BASE_DOMAIN" ]] || die "BASE_DOMAIN est vide. Copie .env.example vers .env et configure ton domaine."
+	local domain="$raw.${BASE_DOMAIN,,}"
+	validate_domain "$domain" || die "domaine généré invalide: $domain"
+	printf '%s\n' "$domain"
+}
+
+cicd_domain() {
+	if [[ -n "$HOSTINATOR_CICD_DOMAIN" ]]; then
+		domain_for "$HOSTINATOR_CICD_DOMAIN"
+		return
+	fi
+
+	if [[ -n "$BASE_DOMAIN" ]]; then
+		domain_for "$HOSTINATOR_CICD_SUBDOMAIN"
+		return
+	fi
+
+	return 1
+}
+
+slug_for_domain() {
+	local domain="$1"
+	printf '%s\n' "hostinator-${domain//./-}"
+}
+
+override_file_for_domain() {
+	local domain="$1"
+	printf '%s/%s.override.yaml\n' "$RUN_DIR/compose-overrides" "$domain"
+}
+
+find_compose_file() {
+	local app_dir="$1"
+	local requested="${2:-}"
+	local candidates=()
+
+	if [[ -n "$requested" ]]; then
+		candidates=("$requested")
+	else
+		candidates=(compose.yaml compose.yml docker-compose.yaml docker-compose.yml)
+	fi
+
+	local candidate
+	for candidate in "${candidates[@]}"; do
+		if [[ -f "$app_dir/$candidate" ]]; then
+			printf '%s\n' "$app_dir/$candidate"
+			return
+		fi
+	done
+
+	if [[ -n "$requested" ]]; then
+		die "fichier compose introuvable dans le repo: $requested"
+	fi
+	die "aucun compose.yaml/compose.yml/docker-compose.yaml/docker-compose.yml trouvé dans $app_dir"
+}
+
+app_compose_cmd() {
+	local app_dir="$1"
+	local project="$2"
+	local compose_file="$3"
+	local override_file="${4:-}"
+	shift 4
+
+	local args=(docker compose -p "$project" --project-directory "$app_dir" -f "$compose_file")
+	if [[ -n "$override_file" && -f "$override_file" ]]; then
+		args+=(-f "$override_file")
+	fi
+	"${args[@]}" "$@"
+}
+
+select_service() {
+	local app_dir="$1"
+	local project="$2"
+	local compose_file="$3"
+	local requested="${4:-}"
+	local services
+	services="$(app_compose_cmd "$app_dir" "$project" "$compose_file" "" config --services)"
+
+	if [[ -n "$requested" ]]; then
+		grep -Fxq "$requested" <<< "$services" || die "service '$requested' absent du compose. Services: $(tr '\n' ' ' <<< "$services")"
+		printf '%s\n' "$requested"
+		return
+	fi
+
+	if grep -Fxq web <<< "$services"; then
+		printf '%s\n' web
+		return
+	fi
+
+	local count
+	count="$(grep -cve '^[[:space:]]*$' <<< "$services" || true)"
+	if [[ "$count" == "1" ]]; then
+		printf '%s\n' "$services"
+		return
+	fi
+
+	die "plusieurs services détectés ($(tr '\n' ' ' <<< "$services")). Ajoute --service <nom>."
+}
+
+container_name() {
+	local cid="$1"
+	docker inspect --format '{{.Name}}' "$cid" | sed 's#^/##'
+}
+
+infer_port() {
+	local cid="$1"
+	local port
+
+	port="$(docker inspect --format '{{range $port, $_ := .Config.ExposedPorts}}{{println $port}}{{end}}' "$cid" 2>/dev/null | sed -n 's#/tcp$##p' | head -n 1)"
+	if [[ -n "$port" ]]; then
+		printf '%s\n' "$port"
+		return
+	fi
+
+	port="$(docker inspect --format '{{range $port, $_ := .NetworkSettings.Ports}}{{println $port}}{{end}}' "$cid" 2>/dev/null | sed -n 's#/tcp$##p' | head -n 1)"
+	if [[ -n "$port" ]]; then
+		printf '%s\n' "$port"
+		return
+	fi
+}
+
+host_port_used_in_state() {
+	local port="$1"
+	[[ -f "$STATE_FILE" ]] || return 1
+	awk -F '\t' -v port="$port" 'NF >= 8 && $8 == port { found = 1 } END { exit !found }' "$STATE_FILE"
+}
+
+host_port_is_listening() {
+	local port="$1"
+	if command -v ss >/dev/null 2>&1; then
+		ss -ltnH "sport = :$port" | grep -q .
+		return
+	fi
+	return 1
+}
+
+allocate_host_port() {
+	local port
+	validate_port "$HOSTINATOR_PORT_START" || die "HOSTINATOR_PORT_START invalide: $HOSTINATOR_PORT_START"
+	validate_port "$HOSTINATOR_PORT_END" || die "HOSTINATOR_PORT_END invalide: $HOSTINATOR_PORT_END"
+	(( HOSTINATOR_PORT_START <= HOSTINATOR_PORT_END )) || die "plage de ports invalide: $HOSTINATOR_PORT_START-$HOSTINATOR_PORT_END"
+
+	for port in $(seq "$HOSTINATOR_PORT_START" "$HOSTINATOR_PORT_END"); do
+		if ! host_port_used_in_state "$port" && ! host_port_is_listening "$port"; then
+			printf '%s\n' "$port"
+			return
+		fi
+	done
+
+	die "aucun port libre dans la plage $HOSTINATOR_PORT_START-$HOSTINATOR_PORT_END"
+}
+
+write_compose_override() {
+	local domain="$1"
+	local service="$2"
+	local container_port="$3"
+	local host_port="$4"
+	local override_file
+	override_file="$(override_file_for_domain "$domain")"
+	mkdir -p "$(dirname "$override_file")"
+
+	validate_port "$container_port" || die "port interne invalide: $container_port"
+	validate_port "$host_port" || die "port host invalide: $host_port"
+
+	cat > "$override_file" <<EOF
+services:
+  "$service":
+    ports:
+      - "127.0.0.1:$host_port:$container_port"
+EOF
+
+	printf '%s\n' "$override_file"
+}
+
+write_caddy_site() {
+	local domain="$1"
+	local host_port="$2"
+	local site_file="$CADDY_SITES_DIR/$domain.caddy"
+	local tmp
+	tmp="$(mktemp "$STATE_DIR/$domain.caddy.tmp.XXXXXX")"
+
+	{
+		printf '# Généré par Hostinator. Les changements manuels peuvent être remplacés.\n'
+		printf '%s {\n' "$domain"
+		printf '\tencode zstd gzip\n'
+		printf '\treverse_proxy 127.0.0.1:%s\n' "$host_port"
+		printf '}\n'
+	} > "$tmp"
+
+	as_root install -m 0644 "$tmp" "$site_file"
+	rm -f "$tmp"
+}
+
+write_cicd_site() {
+	local domain port site_file tmp
+	if ! domain="$(cicd_domain)"; then
+		warn "BASE_DOMAIN est vide: le sous-domaine CI/CD n'a pas été généré"
+		return
+	fi
+
+	port="$(webhook_port)"
+	site_file="$CADDY_SITES_DIR/000-hostinator-cicd.caddy"
+	tmp="$(mktemp "$STATE_DIR/hostinator-cicd.caddy.tmp.XXXXXX")"
+
+	{
+		printf '# Généré par Hostinator. Endpoint GitHub: https://%s/webhooks/github\n' "$domain"
+		printf '%s {\n' "$domain"
+		printf '\tencode zstd gzip\n'
+		printf '\treverse_proxy 127.0.0.1:%s\n' "$port"
+		printf '}\n'
+	} > "$tmp"
+
+	as_root install -m 0644 "$tmp" "$site_file"
+	rm -f "$tmp"
+	log "Sous-domaine CI/CD: https://$domain/webhooks/github"
+}
+
+save_state() {
+	local domain="$1"
+	local repo="$2"
+	local app_dir="$3"
+	local project="$4"
+	local compose_file="$5"
+	local service="$6"
+	local container_port="$7"
+	local host_port="$8"
+	local branch="$9"
+	local compose_rel="${compose_file#"$app_dir"/}"
+	local tmp
+
+	touch "$STATE_FILE"
+	tmp="$(mktemp "$STATE_FILE.tmp.XXXXXX")"
+	grep -Fv "${domain}	" "$STATE_FILE" > "$tmp" || true
+	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$domain" "$repo" "$app_dir" "$project" "$compose_rel" "$service" "$container_port" "$host_port" "$branch" >> "$tmp"
+	mv "$tmp" "$STATE_FILE"
+}
+
+state_row_for_domain() {
+	local domain="$1"
+	[[ -f "$STATE_FILE" ]] || return 1
+	awk -F '\t' -v domain="$domain" '$1 == domain { row = $0 } END { if (row) print row; else exit 1 }' "$STATE_FILE"
+}
+
+current_branch() {
+	local app_dir="$1"
+	git -C "$app_dir" symbolic-ref --quiet --short HEAD 2>/dev/null || true
+}
+
+clone_or_pull() {
+	local repo="$1"
+	local app_dir="$2"
+	local branch="${3:-}"
+
+	if [[ -d "$app_dir/.git" ]]; then
+		log "Pull Git dans $app_dir"
+		git -C "$app_dir" fetch --all --prune
+		if [[ -n "$branch" ]]; then
+			git -C "$app_dir" checkout "$branch"
+			git -C "$app_dir" pull --ff-only origin "$branch"
+		else
+			git -C "$app_dir" pull --ff-only
+		fi
+		return
+	fi
+
+	[[ ! -e "$app_dir" ]] || die "$app_dir existe déjà mais n'est pas un repo Git"
+	log "Clone Git de $repo dans $app_dir"
+	if [[ -n "$branch" ]]; then
+		git clone --branch "$branch" "$repo" "$app_dir"
+	else
+		git clone "$repo" "$app_dir"
+	fi
+}
+
+compose_up() {
+	local app_dir="$1"
+	local project="$2"
+	local compose_file="$3"
+	local override_file="$4"
+	local force_build="$5"
+	local up_args=(up -d --remove-orphans)
+
+	if [[ "$force_build" == "1" ]]; then
+		up_args+=(--build)
+	fi
+
+	app_compose_cmd "$app_dir" "$project" "$compose_file" "$override_file" "${up_args[@]}"
+}
+
+deploy_site() {
+	local domain="$1"
+	local repo="$2"
+	local branch="$3"
+	local requested_service="$4"
+	local requested_container_port="$5"
+	local requested_compose="$6"
+	local force_build="$7"
+	local requested_host_port="${8:-}"
+
+	local slug project app_dir compose_file service cid container_port host_port override_file branch_to_save
+	slug="$(slug_for_domain "$domain")"
+	project="$slug"
+	app_dir="$APPS_DIR/$slug"
+	override_file="$(override_file_for_domain "$domain")"
+
+	ensure_dirs
+	clone_or_pull "$repo" "$app_dir" "$branch"
+	branch_to_save="${branch:-$(current_branch "$app_dir")}"
+
+	compose_file="$(find_compose_file "$app_dir" "$requested_compose")"
+	service="$(select_service "$app_dir" "$project" "$compose_file" "$requested_service")"
+
+	log "Pull des images Docker du repo si disponibles"
+	app_compose_cmd "$app_dir" "$project" "$compose_file" "" pull --ignore-pull-failures || true
+
+	container_port="$requested_container_port"
+	host_port="$requested_host_port"
+
+	if [[ -n "$container_port" ]]; then
+		validate_port "$container_port" || die "port interne invalide: $container_port"
+		if [[ -z "$host_port" ]]; then
+			host_port="$(allocate_host_port)"
+		fi
+		override_file="$(write_compose_override "$domain" "$service" "$container_port" "$host_port")"
+		log "Lancement du compose app: projet=$project service=$service host=127.0.0.1:$host_port"
+		compose_up "$app_dir" "$project" "$compose_file" "$override_file" "$force_build"
+	else
+		log "Lancement initial du compose app pour détecter le port: projet=$project service=$service"
+		compose_up "$app_dir" "$project" "$compose_file" "" "$force_build"
+
+		cid="$(app_compose_cmd "$app_dir" "$project" "$compose_file" "" ps -q "$service" | head -n 1)"
+		[[ -n "$cid" ]] || die "impossible de trouver le conteneur du service $service"
+
+		container_port="$(infer_port "$cid" || true)"
+		if [[ -z "$container_port" ]]; then
+			container_port="80"
+			warn "port interne non détecté pour $service, utilisation de 80. Relance avec --port <port> si besoin."
+		fi
+		validate_port "$container_port" || die "port interne invalide: $container_port"
+		host_port="$(allocate_host_port)"
+		override_file="$(write_compose_override "$domain" "$service" "$container_port" "$host_port")"
+
+		log "Relance du compose app avec exposition localhost: 127.0.0.1:$host_port -> $container_port"
+		compose_up "$app_dir" "$project" "$compose_file" "$override_file" "$force_build"
+	fi
+
+	cid="$(app_compose_cmd "$app_dir" "$project" "$compose_file" "$override_file" ps -q "$service" | head -n 1)"
+	[[ -n "$cid" ]] || die "impossible de trouver le conteneur du service $service"
+
+	write_caddy_site "$domain" "$host_port"
+	save_state "$domain" "$repo" "$app_dir" "$project" "$compose_file" "$service" "$container_port" "$host_port" "$branch_to_save"
+	reload_caddy
+
+	log "OK: https://$domain -> 127.0.0.1:$host_port ($(container_name "$cid"):$container_port)"
+}
+
+cmd_init() {
+	require_runtime
+	require_cmd caddy
+	ensure_caddy_config
+	write_cicd_site
+
+	if command -v systemctl >/dev/null 2>&1; then
+		log "Activation du service Caddy"
+		as_root systemctl enable --now caddy
+	fi
+
+	reload_caddy
+	log "OK: Hostinator est initialisé"
+}
+
+cmd_add() {
+	require_runtime
+	[[ $# -ge 2 ]] || die "add attend un sous-domaine/domaine et un repo Git"
+
+	local first="$1"
+	local second="$2"
+	shift 2
+
+	local raw_domain repo
+	if is_git_ref "$first" && ! is_git_ref "$second"; then
+		repo="$first"
+		raw_domain="$second"
+	else
+		raw_domain="$first"
+		repo="$second"
+	fi
+
+	local branch="" service="" port="" host_port="" compose_file="" build="0"
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			--branch)
+				branch="${2:-}"
+				[[ -n "$branch" ]] || die "--branch attend une valeur"
+				shift 2
+				;;
+			--service)
+				service="${2:-}"
+				[[ -n "$service" ]] || die "--service attend une valeur"
+				shift 2
+				;;
+			--port)
+				port="${2:-}"
+				validate_port "$port" || die "--port invalide: $port"
+				shift 2
+				;;
+			--host-port)
+				host_port="${2:-}"
+				validate_port "$host_port" || die "--host-port invalide: $host_port"
+				shift 2
+				;;
+			--compose)
+				compose_file="${2:-}"
+				[[ -n "$compose_file" ]] || die "--compose attend une valeur"
+				shift 2
+				;;
+			--build)
+				build="1"
+				shift
+				;;
+			-h|--help)
+				usage
+				exit 0
+				;;
+			*)
+				die "option inconnue: $1"
+				;;
+		esac
+	done
+
+	local domain
+	domain="$(domain_for "$raw_domain")"
+	with_deploy_lock
+	deploy_site "$domain" "$repo" "$branch" "$service" "$port" "$compose_file" "$build" "$host_port"
+}
+
+cmd_update() {
+	require_runtime
+	[[ $# -ge 1 ]] || die "update attend un sous-domaine/domaine"
+	local raw_domain="$1"
+	shift
+
+	local build="1"
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			--no-build)
+				build="0"
+				shift
+				;;
+			--build)
+				build="1"
+				shift
+				;;
+			-h|--help)
+				usage
+				exit 0
+				;;
+			*)
+				die "option inconnue: $1"
+				;;
+		esac
+	done
+
+	local domain row repo _app_dir _project compose_rel service container_port host_port branch
+	domain="$(domain_for "$raw_domain")"
+	row="$(state_row_for_domain "$domain")" || die "aucun état trouvé pour $domain. Utilise add d'abord."
+	IFS=$'\t' read -r _ repo _app_dir _project compose_rel service container_port host_port branch <<< "$row"
+	with_deploy_lock
+	deploy_site "$domain" "$repo" "$branch" "$service" "$container_port" "$compose_rel" "$build" "$host_port"
+}
+
+cmd_remove() {
+	require_runtime
+	[[ $# -eq 1 ]] || die "remove attend un seul sous-domaine/domaine"
+	local domain row _repo app_dir project compose_rel _service _container_port _host_port _branch site_file override_file tmp
+	domain="$(domain_for "$1")"
+	row="$(state_row_for_domain "$domain")" || die "aucun état trouvé pour $domain"
+	IFS=$'\t' read -r _ _repo app_dir project compose_rel _service _container_port _host_port _branch <<< "$row"
+
+	with_deploy_lock
+	override_file="$(override_file_for_domain "$domain")"
+	if [[ -f "$app_dir/$compose_rel" ]]; then
+		log "Arrêt du compose app $project"
+		app_compose_cmd "$app_dir" "$project" "$app_dir/$compose_rel" "$override_file" down || true
+	fi
+
+	site_file="$CADDY_SITES_DIR/$domain.caddy"
+	as_root rm -f "$site_file"
+	rm -f "$override_file"
+
+	tmp="$(mktemp "$STATE_FILE.tmp.XXXXXX")"
+	grep -Fv "${domain}	" "$STATE_FILE" > "$tmp" || true
+	mv "$tmp" "$STATE_FILE"
+	reload_caddy
+	log "OK: $domain supprimé"
+}
+
+cmd_list() {
+	if [[ ! -s "$STATE_FILE" ]]; then
+		log "Aucun site enregistré"
+		return
+	fi
+	printf 'DOMAIN\tREPO\tAPP_DIR\tPROJECT\tCOMPOSE\tSERVICE\tCONTAINER_PORT\tHOST_PORT\tBRANCH\n'
+	cat "$STATE_FILE"
+}
+
+normalize_repo_ref() {
+	local value="$1"
+	value="$(printf '%s\n' "$value" | sed -E 's#^https?://##; s#^ssh://##; s#^git@([^:]+):#\1/#; s#^git@##; s#\.git$##')"
+	printf '%s\n' "${value,,}"
+}
+
+repo_matches_any() {
+	local stored="$1"
+	shift
+	local stored_norm candidate candidate_norm
+	stored_norm="$(normalize_repo_ref "$stored")"
+	for candidate in "$@"; do
+		candidate_norm="$(normalize_repo_ref "$candidate")"
+		if [[ "$stored_norm" == "$candidate_norm" ]]; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+cmd_webhook_update() {
+	require_runtime
+	local branch=""
+	local repos=()
+
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			--repo)
+				[[ -n "${2:-}" ]] || die "--repo attend une valeur"
+				repos+=("$2")
+				shift 2
+				;;
+			--branch)
+				branch="${2:-}"
+				[[ -n "$branch" ]] || die "--branch attend une valeur"
+				shift 2
+				;;
+			-h|--help)
+				usage
+				exit 0
+				;;
+			*)
+				die "option inconnue: $1"
+				;;
+		esac
+	done
+
+	[[ ${#repos[@]} -gt 0 ]] || die "webhook-update attend au moins un --repo"
+	[[ -n "$branch" ]] || die "webhook-update attend --branch"
+
+	if [[ ! -s "$STATE_FILE" ]]; then
+		warn "aucun site enregistré"
+		return
+	fi
+
+	with_deploy_lock
+	local rows=()
+	mapfile -t rows < "$STATE_FILE"
+
+	local matched="0"
+	local row domain repo _app_dir _project compose_rel service container_port host_port saved_branch
+	for row in "${rows[@]}"; do
+		[[ -n "$row" ]] || continue
+		IFS=$'\t' read -r domain repo _app_dir _project compose_rel service container_port host_port saved_branch <<< "$row"
+		if ! repo_matches_any "$repo" "${repos[@]}"; then
+			continue
+		fi
+		if [[ -n "$saved_branch" && "$saved_branch" != "$branch" ]]; then
+			log "Webhook ignoré pour $domain: branche suivie=$saved_branch, branche reçue=$branch"
+			continue
+		fi
+		matched="1"
+		log "Webhook: mise à jour de $domain depuis $branch"
+		deploy_site "$domain" "$repo" "${saved_branch:-$branch}" "$service" "$container_port" "$compose_rel" "1" "$host_port"
+	done
+
+	if [[ "$matched" != "1" ]]; then
+		warn "aucun site ne correspond au repo reçu pour la branche $branch"
+	fi
+}
+
+main() {
+	local cmd="${1:-}"
+	if [[ -z "$cmd" || "$cmd" == "-h" || "$cmd" == "--help" ]]; then
+		usage
+		exit 0
+	fi
+	shift
+
+	case "$cmd" in
+		init) cmd_init "$@" ;;
+		add) cmd_add "$@" ;;
+		update) cmd_update "$@" ;;
+		remove|rm) cmd_remove "$@" ;;
+		list|ls) cmd_list "$@" ;;
+		webhook-update) cmd_webhook_update "$@" ;;
+		*) die "commande inconnue: $cmd" ;;
+	esac
+}
+
+main "$@"

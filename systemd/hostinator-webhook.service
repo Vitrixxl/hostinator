@@ -1,0 +1,14 @@
+[Unit]
+Description=Hostinator GitHub webhook
+After=network-online.target docker.service caddy.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/hostinator/hostinator.env
+ExecStart=/usr/local/bin/hostinator-webhook
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
