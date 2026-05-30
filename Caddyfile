@@ -1,0 +1,6 @@
+{
+	# Décommente si tu veux associer les certificats Let's Encrypt à un email.
+	# email admin@example.com
+}
+
+import /etc/caddy/sites/*.caddy
