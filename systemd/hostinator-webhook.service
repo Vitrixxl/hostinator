@@ -5,7 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=/etc/hostinator/hostinator.env
+WorkingDirectory=/home/vitrix/hostinator
+Environment=HOSTINATOR_ENV_FILE=/home/vitrix/hostinator/.env
 ExecStart=/usr/local/bin/hostinator-webhook
 Restart=always
 RestartSec=5

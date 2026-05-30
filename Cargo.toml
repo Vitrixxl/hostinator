@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 axum = "0.7"
+dotenvy = "0.15"
 hex = "0.4"
 hmac = "0.12"
 serde = { version = "1", features = ["derive"] }

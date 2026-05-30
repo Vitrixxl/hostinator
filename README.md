@@ -33,6 +33,7 @@ cp .env.example .env
 ```env
 BASE_DOMAIN=example.com
 HOSTINATOR_HOME=/home/vitrix/hostinator
+HOSTINATOR_BIN=/usr/local/bin/hostinator
 HOSTINATOR_GITHUB_WEBHOOK_SECRET=un-secret-long
 ```
 
@@ -52,20 +53,20 @@ cargo build --release
 sudo install -m 0755 bin/hostinator /usr/local/bin/hostinator
 sudo install -m 0755 target/release/hostinator-webhook /usr/local/bin/hostinator-webhook
 
-sudo mkdir -p /etc/hostinator
-sudo install -m 0600 systemd/hostinator.env.example /etc/hostinator/hostinator.env
 sudo install -m 0644 systemd/hostinator-webhook.service /etc/systemd/system/hostinator-webhook.service
 ```
 
-Édite `/etc/hostinator/hostinator.env`, puis initialise Caddy:
+Initialise Caddy depuis le dossier du repo. Hostinator lit le `.env` du repo:
 
 ```bash
-hostinator init
+sudo hostinator init
 sudo systemctl daemon-reload
 sudo systemctl enable --now hostinator-webhook
 ```
 
-`hostinator init` crée l'import Caddy si le fichier `/etc/caddy/Caddyfile` n'existe pas, crée `/etc/caddy/sites`, et génère le vhost `ci-cd.<BASE_DOMAIN>`.
+Le service systemd charge aussi ce même fichier: `/home/vitrix/hostinator/.env`.
+
+`sudo hostinator init` crée `/etc/caddy/sites`, ajoute l'import Hostinator dans `/etc/caddy/Caddyfile` si besoin, et génère le vhost `ci-cd.<BASE_DOMAIN>`.
 
 ## Ajouter une app
 
@@ -130,23 +131,13 @@ hostinator remove api
 
 Cette commande arrête le compose de l'app, supprime l'entrée Caddy générée et recharge Caddy.
 
-## CI du projet
-
-Le workflow `.github/workflows/ci.yml` vérifie:
-
-- syntaxe Bash;
-- Shellcheck;
-- `cargo fmt --check`;
-- `cargo check --locked`;
-- build release du webhook.
-
 ## Fichiers utiles
 
 - `bin/hostinator`: CLI principal.
 - `bin/site`: wrapper de compatibilité vers `bin/hostinator`.
 - `src/main.rs`: API Rust du webhook GitHub.
 - `systemd/hostinator-webhook.service`: service systemd de l'API Rust.
-- `systemd/hostinator.env.example`: environnement système à copier dans `/etc/hostinator/hostinator.env`.
+- `.env`: configuration unique utilisée par le CLI et le service webhook.
 - `$HOSTINATOR_HOME/repos`: repos Git clonés.
 - `$HOSTINATOR_HOME/state/sites.tsv`: état utilisé par `update`, `remove`, `list` et le webhook.
 - `$HOSTINATOR_HOME/run/compose-overrides`: overrides Docker Compose générés pour exposer les apps sur localhost.

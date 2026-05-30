@@ -2,19 +2,24 @@
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENV_FILE="$ROOT_DIR/.env"
-SYSTEM_ENV_FILE="${HOSTINATOR_ENV_FILE:-/etc/hostinator/hostinator.env}"
+if [[ -n "${HOSTINATOR_ENV_FILE:-}" ]]; then
+	ENV_FILE="$HOSTINATOR_ENV_FILE"
+elif [[ -f "$PWD/.env" ]]; then
+	ENV_FILE="$PWD/.env"
+else
+	ENV_FILE="$ROOT_DIR/.env"
+fi
 
 load_env_file() {
 	local file="$1"
 	[[ -f "$file" ]] || return 0
+	[[ -r "$file" ]] || return 0
 	set -a
 	# shellcheck disable=SC1090
 	. "$file"
 	set +a
 }
 
-load_env_file "$SYSTEM_ENV_FILE"
 load_env_file "$ENV_FILE"
 
 HOSTINATOR_HOME="${HOSTINATOR_HOME:-$HOME/hostinator}"
@@ -123,8 +128,8 @@ ensure_caddy_config() {
 	fi
 
 	if ! grep -Eq "^[[:space:]]*import[[:space:]]+$CADDY_SITES_DIR/[*][.]caddy" "$CADDYFILE"; then
-		warn "$CADDYFILE existe déjà. Ajoute cette ligne pour charger les sites Hostinator:"
-		warn "import $CADDY_SITES_DIR/*.caddy"
+		log "Ajout de l'import Hostinator dans $CADDYFILE"
+		printf '\n# Sites générés par Hostinator\nimport %s/*.caddy\n' "$CADDY_SITES_DIR" | as_root tee -a "$CADDYFILE" >/dev/null
 	fi
 }
 
@@ -136,8 +141,8 @@ reload_caddy() {
 		as_root caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null
 	fi
 
-	if command -v systemctl >/dev/null 2>&1 && as_root systemctl is-active --quiet caddy; then
-		as_root systemctl reload caddy
+	if command -v systemctl >/dev/null 2>&1 && as_root systemctl list-unit-files caddy.service >/dev/null 2>&1; then
+		as_root systemctl reload-or-restart caddy
 		return
 	fi
 

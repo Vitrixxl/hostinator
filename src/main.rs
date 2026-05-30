@@ -81,6 +81,8 @@ async fn main() -> AppResult<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
+    load_env_file();
+
     let addr: SocketAddr = env::var("HOSTINATOR_WEBHOOK_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:7878".to_string())
         .parse()?;
@@ -95,6 +97,15 @@ async fn main() -> AppResult<()> {
     let listener = TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn load_env_file() {
+    if let Ok(path) = env::var("HOSTINATOR_ENV_FILE") {
+        let _ = dotenvy::from_path(path);
+        return;
+    }
+
+    let _ = dotenvy::dotenv();
 }
 
 async fn health() -> &'static str {
